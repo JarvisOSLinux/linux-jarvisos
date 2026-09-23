@@ -488,6 +488,8 @@ void __ntfs_init_inode(struct super_block *sb, struct ntfs_inode *ni)
 	ni->flags = 0;
 	ni->mft_lcn[0] = LCN_RL_NOT_MAPPED;
 	ni->mft_lcn_count = 0;
+	ni->reparse_tag = 0;
+	ni->reparse_flags = 0;
 	ni->target = NULL;
 	ni->i_dealloc_clusters = 0;
 }
@@ -680,6 +682,7 @@ static int ntfs_read_locked_inode(struct inode *vi)
 	unsigned int name_len = 4, flags = 0;
 	int extend_sys = 0;
 	dev_t dev = 0;
+	bool has_lxmod = false;
 	bool vol_err = true;
 
 	ntfs_debug("Entering for i_ino 0x%llx.", ni->mft_no);
@@ -848,49 +851,62 @@ static int ntfs_read_locked_inode(struct inode *vi)
 					a->data.resident.value_offset),
 					le32_to_cpu(
 					a->data.resident.value_length));
+			/* A resident list is not validated on load; check it now. */
+			if (!ntfs_attr_list_is_valid(ni->attr_list,
+						     ni->attr_list_size)) {
+				ntfs_error(vi->i_sb, "Corrupt attribute list.");
+				goto unm_err_out;
+			}
 		}
 	}
 skip_attr_list_load:
 	err = ntfs_attr_lookup(AT_EA_INFORMATION, NULL, 0, 0, 0, NULL, 0, ctx);
 	if (!err) {
 		NInoSetHasEA(ni);
-		ntfs_ea_get_wsl_inode(vi, &dev, flags);
+		ntfs_ea_get_wsl_inode(vi, &dev, flags, &has_lxmod);
 	}
 
-	if (m->flags & MFT_RECORD_IS_DIRECTORY) {
+	if (ni->flags & FILE_ATTR_REPARSE_POINT) {
+		unsigned int mode;
+
+		mode = ntfs_make_symlink(ni);
+		if (mode)
+			vi->i_mode |= mode;
+		else {
+			vi->i_mode &= ~S_IFLNK;
+			if (m->flags & MFT_RECORD_IS_DIRECTORY)
+				vi->i_mode |= S_IFDIR;
+			else
+				vi->i_mode |= S_IFREG;
+		}
+	} else if (m->flags & MFT_RECORD_IS_DIRECTORY) {
 		vi->i_mode |= S_IFDIR;
+	} else {
+		vi->i_mode |= S_IFREG;
+	}
+
+	if (S_ISDIR(vi->i_mode)) {
 		/*
-		 * Apply the directory permissions mask set in the mount
-		 * options.
+		 * Apply the directory permissions mask set in the mount options
+		 * when no per-file WSL mode is present.
 		 */
-		vi->i_mode &= ~vol->dmask;
+		if (!has_lxmod)
+			vi->i_mode &= ~vol->dmask;
 		/* Things break without this kludge! */
 		if (vi->i_nlink > 1)
 			set_nlink(vi, 1);
 	} else {
-		if (ni->flags & FILE_ATTR_REPARSE_POINT) {
-			unsigned int mode;
-
-			mode = ntfs_make_symlink(ni);
-			if (mode)
-				vi->i_mode |= mode;
-			else {
-				vi->i_mode &= ~S_IFLNK;
-				vi->i_mode |= S_IFREG;
-			}
-		} else
-			vi->i_mode |= S_IFREG;
-		/* Apply the file permissions mask set in the mount options. */
-		vi->i_mode &= ~vol->fmask;
+		/* Apply the file permissions mask when no WSL mode is present. */
+		if (!has_lxmod)
+			vi->i_mode &= ~vol->fmask;
 	}
 
 	/*
 	 * If an attribute list is present we now have the attribute list value
 	 * in ntfs_ino->attr_list and it is ntfs_ino->attr_list_size bytes.
 	 */
-	if (S_ISDIR(vi->i_mode)) {
+	if (m->flags & MFT_RECORD_IS_DIRECTORY) {
 		struct index_root *ir;
-		u8 *ir_end, *index_end;
 
 view_index_meta:
 		/* It is a directory, find index root attribute. */
@@ -940,10 +956,9 @@ view_index_meta:
 		}
 		ir = (struct index_root *)((u8 *)a +
 				le16_to_cpu(a->data.resident.value_offset));
-		ir_end = (u8 *)ir + le32_to_cpu(a->data.resident.value_length);
-		index_end = (u8 *)&ir->index +
-				le32_to_cpu(ir->index.index_length);
-		if (index_end > ir_end) {
+		if (ntfs_index_root_inconsistent(ni->vol, a, ir, ni->mft_no) ||
+		    ntfs_index_entries_inconsistent(ni->vol, &ir->index,
+						    ir->collation_rule, ni->mft_no)) {
 			ntfs_error(vi->i_sb, "Directory index is corrupt.");
 			goto unm_err_out;
 		}
@@ -1014,7 +1029,7 @@ view_index_meta:
 		m = NULL;
 		ctx = NULL;
 		/* Setup the operations for this inode. */
-		ntfs_set_vfs_operations(vi, S_IFDIR, 0);
+		ntfs_set_vfs_operations(vi, vi->i_mode, 0);
 		if (ir->index.flags & LARGE_INDEX)
 			NInoSetIndexAllocPresent(ni);
 	} else {
@@ -1180,6 +1195,15 @@ no_data_attr_special_case:
 		vi->i_flags |= S_IMMUTABLE;
 
 	/*
+	 * System files such as $Bitmap and $MFT are maintained by the driver
+	 * itself, and writing them from userspace corrupts the volume.
+	 * Always make them immutable regardless of the sys_immutable option.
+	 * Directories are skipped so the root and $Extend stay usable.
+	 */
+	if (ni->mft_no < FILE_first_user && S_ISREG(vi->i_mode))
+		vi->i_flags |= S_IMMUTABLE;
+
+	/*
 	 * The number of 512-byte blocks used on disk (for stat). This is in so
 	 * far inaccurate as it doesn't account for any named streams or other
 	 * special non-resident attributes, but that is how Windows works, too,
@@ -1194,6 +1218,9 @@ no_data_attr_special_case:
 		vi->i_blocks = ni->itype.compressed.size >> 9;
 	else
 		vi->i_blocks = ni->allocated_size >> 9;
+
+	if (S_ISLNK(vi->i_mode) && ni->target)
+		vi->i_size = strlen(ni->target);
 
 	ntfs_debug("Done.");
 	return 0;
@@ -1483,7 +1510,6 @@ static int ntfs_read_locked_index_inode(struct inode *base_vi, struct inode *vi)
 	struct attr_record *a;
 	struct ntfs_attr_search_ctx *ctx;
 	struct index_root *ir;
-	u8 *ir_end, *index_end;
 	int err = 0;
 
 	ntfs_debug("Entering for i_ino 0x%llx.", ni->mft_no);
@@ -1534,9 +1560,9 @@ static int ntfs_read_locked_index_inode(struct inode *base_vi, struct inode *vi)
 	}
 
 	ir = (struct index_root *)((u8 *)a + le16_to_cpu(a->data.resident.value_offset));
-	ir_end = (u8 *)ir + le32_to_cpu(a->data.resident.value_length);
-	index_end = (u8 *)&ir->index + le32_to_cpu(ir->index.index_length);
-	if (index_end > ir_end) {
+	if (ntfs_index_root_inconsistent(vol, a, ir, ni->mft_no) ||
+	    ntfs_index_entries_inconsistent(vol, &ir->index,
+					    ir->collation_rule, ni->mft_no)) {
 		ntfs_error(vi->i_sb, "Index is corrupt.");
 		goto unm_err_out;
 	}
@@ -1994,10 +2020,7 @@ int ntfs_read_inode_mount(struct inode *vi)
 			/* Catch the end of the attribute list. */
 			if ((u8 *)al_entry == al_end)
 				goto em_put_err_out;
-			if (!al_entry->length)
-				goto em_put_err_out;
-			if ((u8 *)al_entry + 6 > al_end ||
-			    (u8 *)al_entry + le16_to_cpu(al_entry->length) > al_end)
+			if (!ntfs_attr_list_entry_is_valid(al_entry, al_end))
 				goto em_put_err_out;
 			next_al_entry = (struct attr_list_entry *)((u8 *)al_entry +
 					le16_to_cpu(al_entry->length));
@@ -2367,6 +2390,14 @@ int ntfs_show_options(struct seq_file *sf, struct dentry *root)
 		seq_puts(sf, ",discard");
 	if (NVolDisableSparse(vol))
 		seq_puts(sf, ",disable_sparse");
+	if (NVolNativeSymlinkRel(vol))
+		seq_puts(sf, ",native_symlink=rel");
+	else
+		seq_puts(sf, ",native_symlink=raw");
+	if (NVolSymlinkNative(vol))
+		seq_puts(sf, ",symlink=native");
+	else
+		seq_puts(sf, ",symlink=wsl");
 	if (vol->sb->s_flags & SB_POSIXACL)
 		seq_puts(sf, ",acl");
 	return 0;
@@ -3018,6 +3049,7 @@ int ntfs_inode_add_attrlist(struct ntfs_inode *ni)
 	struct attr_list_entry *ale = NULL;
 	struct mft_record *ni_mrec;
 	u32 attr_al_len;
+	bool free_empty_extents = true;
 
 	if (!ni)
 		return -EINVAL;
@@ -3117,6 +3149,7 @@ int ntfs_inode_add_attrlist(struct ntfs_inode *ni)
 		ntfs_error(ni->vol->sb, "Couldn't add $ATTRIBUTE_LIST to MFT");
 		goto rollback;
 	}
+	free_empty_extents = false;
 
 	err = ntfs_attrlist_update(ni);
 	if (err < 0)
@@ -3136,6 +3169,8 @@ remove_attrlist_record:
 				CASE_SENSITIVE, 0, NULL, 0, ctx)) {
 		if (ntfs_attr_record_rm(ctx))
 			ntfs_error(ni->vol->sb, "Rollback failed to remove attrlist");
+		else
+			free_empty_extents = true;
 	} else {
 		ntfs_error(ni->vol->sb, "Rollback failed to find attrlist");
 	}
@@ -3174,6 +3209,11 @@ rollback:
 	ni->attr_list_size = 0;
 	NInoClearAttrList(ni);
 	NInoClearAttrListDirty(ni);
+	ntfs_attr_put_search_ctx(ctx);
+	ctx = NULL;
+	if (free_empty_extents && ntfs_inode_free_empty_extents(ni))
+		ntfs_error(ni->vol->sb, "Rollback failed to free empty extent");
+	goto err_out;
 put_err_out:
 	ntfs_attr_put_search_ctx(ctx);
 err_out:
@@ -3257,6 +3297,55 @@ out:
 	ntfs_destroy_ext_inode(ni);
 	err = 0;
 	ntfs_debug("\n");
+	return err;
+}
+
+/*
+ * ntfs_inode_free_empty_extents - free empty extent MFT records
+ * @ni: base inode whose empty extent records should be freed
+ *
+ * The caller must ensure that no on-disk attribute list references an empty
+ * extent record and must hold @ni->mrec_lock to serialize the extent array.
+ */
+int ntfs_inode_free_empty_extents(struct ntfs_inode *ni)
+{
+	int err = 0, i = 0;
+
+	if (!ni || ni->nr_extents < 0)
+		return -EINVAL;
+
+	mutex_lock(&ni->extent_lock);
+	while (i < ni->nr_extents) {
+		struct ntfs_inode *ext_ni = ni->ext.extent_ntfs_inos[i];
+		struct mft_record *m;
+		int ret;
+
+		m = map_mft_record(ext_ni);
+		if (IS_ERR(m)) {
+			if (!err)
+				err = PTR_ERR(m);
+			i++;
+			continue;
+		}
+		if (le32_to_cpu(m->bytes_in_use) -
+				le16_to_cpu(m->attrs_offset) != 8) {
+			unmap_mft_record(ext_ni);
+			i++;
+			continue;
+		}
+		unmap_mft_record(ext_ni);
+
+		ret = ntfs_mft_record_free(ni->vol, ext_ni);
+		if (ret) {
+			if (!err)
+				err = ret;
+			i++;
+			continue;
+		}
+		ntfs_inode_close(ext_ni);
+		/* ntfs_inode_close() removed this entry from the extent array. */
+	}
+	mutex_unlock(&ni->extent_lock);
 	return err;
 }
 
@@ -3359,6 +3448,9 @@ int ntfs_inode_free_space(struct ntfs_inode *ni, int size)
 	 * Chkdsk complain if $STANDARD_INFORMATION is not in the base MFT
 	 * record.
 	 *
+	 * $INDEX_ROOT must remain resident, but its attribute record may be moved
+	 * to an extent MFT record when the base record needs room for the list.
+	 *
 	 * Also we can't move $ATTRIBUTE_LIST from base MFT_RECORD, so position
 	 * search context on first attribute after $STANDARD_INFORMATION and
 	 * $ATTRIBUTE_LIST.
@@ -3398,9 +3490,6 @@ retry:
 
 		if (ntfs_inode_base(ctx->ntfs_ino)->mft_no == FILE_MFT &&
 				ctx->attr->type == AT_DATA)
-			goto retry;
-
-		if (ctx->attr->type == AT_INDEX_ROOT)
 			goto retry;
 
 		record_size = le32_to_cpu(ctx->attr->length);

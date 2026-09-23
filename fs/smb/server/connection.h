@@ -22,6 +22,7 @@
 #include "ksmbd_work.h"
 
 struct smbdirect_buffer_descriptor_v1;
+struct ksmbd_session;
 
 #define KSMBD_SOCKET_BACKLOG		16
 
@@ -115,12 +116,16 @@ struct ksmbd_conn {
 
 	__le16				cipher_type;
 	__le16				compress_algorithm;
+	/* Negotiated SMB 3.1.1 compression capabilities. */
+	bool				compress_chained;
+	bool				compress_pattern;
 	bool				posix_ext_supported;
 	bool				signing_negotiated;
 	__le16				signing_algorithm;
 	bool				binding;
 	atomic_t			refcnt;
 	bool				is_aapl;
+	bool				aapl_readdir_attr; /* READDIR_ATTR negotiated */
 	struct work_struct		release_work;
 };
 
@@ -163,11 +168,13 @@ extern struct rw_semaphore conn_list_lock;
 
 bool ksmbd_conn_alive(struct ksmbd_conn *conn);
 void ksmbd_conn_wait_idle(struct ksmbd_conn *conn);
-int ksmbd_conn_wait_idle_sess_id(struct ksmbd_conn *curr_conn, u64 sess_id);
+int ksmbd_conn_wait_idle_sess(struct ksmbd_conn *curr_conn,
+			      struct ksmbd_session *sess);
 struct ksmbd_conn *ksmbd_conn_alloc(void);
 void ksmbd_conn_free(struct ksmbd_conn *conn);
 struct ksmbd_conn *ksmbd_conn_get(struct ksmbd_conn *conn);
 void ksmbd_conn_put(struct ksmbd_conn *conn);
+void ksmbd_conn_abort(struct ksmbd_conn *conn);
 int ksmbd_conn_wq_init(void);
 void ksmbd_conn_wq_destroy(void);
 bool ksmbd_conn_lookup_dialect(struct ksmbd_conn *c);
@@ -197,9 +204,23 @@ void ksmbd_conn_r_count_dec(struct ksmbd_conn *conn);
  * This is a hack. We will move status to a proper place once we land
  * a multi-sessions support.
  */
+static inline bool ksmbd_conn_new(struct ksmbd_conn *conn)
+{
+	return READ_ONCE(conn->status) == KSMBD_SESS_NEW;
+}
+
 static inline bool ksmbd_conn_good(struct ksmbd_conn *conn)
 {
 	return READ_ONCE(conn->status) == KSMBD_SESS_GOOD;
+}
+
+static inline unsigned int
+ksmbd_max_allowed_pdu_size(struct ksmbd_conn *conn)
+{
+	if (ksmbd_conn_good(conn))
+		return SMB3_MAX_MSGSIZE + conn->vals->max_write_size;
+
+	return SMB3_MAX_MSGSIZE;
 }
 
 static inline bool ksmbd_conn_need_negotiate(struct ksmbd_conn *conn)
@@ -262,5 +283,5 @@ static inline void ksmbd_conn_set_releasing(struct ksmbd_conn *conn)
 	WRITE_ONCE(conn->status, KSMBD_SESS_RELEASING);
 }
 
-void ksmbd_all_conn_set_status(u64 sess_id, u32 status);
+void ksmbd_all_conn_set_status(struct ksmbd_session *sess, u32 status);
 #endif /* __CONNECTION_H__ */

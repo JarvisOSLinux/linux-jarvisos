@@ -1084,9 +1084,7 @@ struct sk_buff {
 	__u16			network_header;
 	__u16			mac_header;
 
-#ifdef CONFIG_KCOV
-	u64			kcov_handle;
-#endif
+	struct kcov_common_handle_id kcov_handle;
 
 	); /* end headers group */
 
@@ -1315,7 +1313,8 @@ static inline bool skb_data_unref(const struct sk_buff *skb,
 	return true;
 }
 
-void __fix_address sk_skb_reason_drop(struct sock *sk, struct sk_buff *skb,
+void __fix_address sk_skb_reason_drop(const struct sock *sk,
+				      struct sk_buff *skb,
 				      enum skb_drop_reason reason);
 
 static inline void
@@ -3083,6 +3082,11 @@ static inline bool skb_transport_header_was_set(const struct sk_buff *skb)
 	return skb->transport_header != (typeof(skb->transport_header))~0U;
 }
 
+static inline void skb_unset_transport_header(struct sk_buff *skb)
+{
+	skb->transport_header = (typeof(skb->transport_header))~0U;
+}
+
 static inline unsigned char *skb_transport_header(const struct sk_buff *skb)
 {
 	DEBUG_NET_WARN_ON_ONCE(!skb_transport_header_was_set(skb));
@@ -3125,6 +3129,30 @@ static inline void skb_set_transport_header(struct sk_buff *skb,
 {
 	skb_reset_transport_header(skb);
 	skb->transport_header += offset;
+}
+
+/**
+ * skb_set_transport_header_careful - conditionally set transport header
+ * @skb: buffer to alter
+ * @offset: offset to add to skb->data
+ *
+ * Hardened version of skb_set_transport_header().
+ *
+ * Returns: true if the operation was a success.
+ */
+static inline bool __must_check
+skb_set_transport_header_careful(struct sk_buff *skb, const int offset)
+{
+	long thoff = skb->data - skb->head + offset;
+
+	if (unlikely(thoff != (typeof(skb->transport_header))thoff))
+		return false;
+
+	if (unlikely(thoff == (typeof(skb->transport_header))~0U))
+		return false;
+
+	skb->transport_header = thoff;
+	return true;
 }
 
 static inline unsigned char *skb_network_header(const struct sk_buff *skb)
@@ -5439,20 +5467,14 @@ static inline void skb_reset_csum_not_inet(struct sk_buff *skb)
 }
 
 static inline void skb_set_kcov_handle(struct sk_buff *skb,
-				       const u64 kcov_handle)
+				       struct kcov_common_handle_id kcov_handle)
 {
-#ifdef CONFIG_KCOV
 	skb->kcov_handle = kcov_handle;
-#endif
 }
 
-static inline u64 skb_get_kcov_handle(struct sk_buff *skb)
+static inline struct kcov_common_handle_id skb_get_kcov_handle(struct sk_buff *skb)
 {
-#ifdef CONFIG_KCOV
 	return skb->kcov_handle;
-#else
-	return 0;
-#endif
 }
 
 static inline void skb_mark_for_recycle(struct sk_buff *skb)

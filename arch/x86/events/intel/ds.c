@@ -780,9 +780,7 @@ void init_debug_store_on_cpu(int cpu)
 	if (!ds)
 		return;
 
-	wrmsr_on_cpu(cpu, MSR_IA32_DS_AREA,
-		     (u32)((u64)(unsigned long)ds),
-		     (u32)((u64)(unsigned long)ds >> 32));
+	wrmsrq_on_cpu(cpu, MSR_IA32_DS_AREA, (u64)(unsigned long)ds);
 }
 
 void fini_debug_store_on_cpu(int cpu)
@@ -790,7 +788,7 @@ void fini_debug_store_on_cpu(int cpu)
 	if (!per_cpu(cpu_hw_events, cpu).ds)
 		return;
 
-	wrmsr_on_cpu(cpu, MSR_IA32_DS_AREA, 0, 0);
+	wrmsrq_on_cpu(cpu, MSR_IA32_DS_AREA, 0);
 }
 
 static DEFINE_PER_CPU(void *, insn_buffer);
@@ -1095,8 +1093,7 @@ void init_arch_pebs_on_cpu(int cpu)
 	 * contiguous physical buffer (__alloc_pages_node() with order)
 	 */
 	arch_pebs_base = virt_to_phys(cpuc->pebs_vaddr) | PEBS_BUFFER_SHIFT;
-	wrmsr_on_cpu(cpu, MSR_IA32_PEBS_BASE, (u32)arch_pebs_base,
-		     (u32)(arch_pebs_base >> 32));
+	wrmsrq_on_cpu(cpu, MSR_IA32_PEBS_BASE, arch_pebs_base);
 	x86_pmu.pebs_active = 1;
 }
 
@@ -1105,7 +1102,7 @@ inline void fini_arch_pebs_on_cpu(int cpu)
 	if (!x86_pmu.arch_pebs)
 		return;
 
-	wrmsr_on_cpu(cpu, MSR_IA32_PEBS_BASE, 0, 0);
+	wrmsrq_on_cpu(cpu, MSR_IA32_PEBS_BASE, 0);
 }
 
 /*
@@ -1245,7 +1242,10 @@ unlock:
 
 void intel_pmu_drain_pebs_buffer(void)
 {
+	struct cpu_hw_events *cpuc = this_cpu_ptr(&cpu_hw_events);
 	struct perf_sample_data data;
+
+	WARN_ON_ONCE(cpuc->enabled);
 
 	static_call(x86_pmu_drain_pebs)(NULL, &data);
 }
@@ -1292,18 +1292,21 @@ struct event_constraint intel_glm_pebs_event_constraints[] = {
 struct event_constraint intel_grt_pebs_event_constraints[] = {
 	/* Allow all events as PEBS with no flags */
 	INTEL_HYBRID_LAT_CONSTRAINT(0x5d0, 0x3),
-	INTEL_HYBRID_LAT_CONSTRAINT(0x6d0, 0xf),
+	INTEL_HYBRID_LAT_CONSTRAINT(0x6d0, 0x3f),
 	EVENT_CONSTRAINT_END
 };
 
-struct event_constraint intel_arw_pebs_event_constraints[] = {
+struct event_constraint intel_cmt_pebs_event_constraints[] = {
+	/* Allow all events as PEBS with no flags */
+	INTEL_HYBRID_LAT_CONSTRAINT(0x5d0, 0x3),
+	INTEL_HYBRID_LAT_CONSTRAINT(0x6d0, 0xff),
+	EVENT_CONSTRAINT_END
+};
+
+struct event_constraint intel_dkt_pebs_event_constraints[] = {
 	/* Allow all events as PEBS with no flags */
 	INTEL_HYBRID_LAT_CONSTRAINT(0x5d0, 0xff),
 	INTEL_HYBRID_LAT_CONSTRAINT(0x6d0, 0xff),
-	INTEL_FLAGS_UEVENT_CONSTRAINT(0x01d4, 0x1),
-	INTEL_FLAGS_UEVENT_CONSTRAINT(0x02d4, 0x2),
-	INTEL_FLAGS_UEVENT_CONSTRAINT(0x04d4, 0x4),
-	INTEL_FLAGS_UEVENT_CONSTRAINT(0x08d4, 0x8),
 	EVENT_CONSTRAINT_END
 };
 
@@ -1500,6 +1503,13 @@ struct event_constraint intel_lnc_pebs_event_constraints[] = {
 	INTEL_FLAGS_UEVENT_CONSTRAINT(0x100, 0x100000000ULL),	/* INST_RETIRED.PREC_DIST */
 	INTEL_FLAGS_UEVENT_CONSTRAINT(0x0400, 0x800000000ULL),
 
+	INTEL_FLAGS_UEVENT_CONSTRAINT(0x012a, 0x1),		/* OCR.* events */
+	INTEL_FLAGS_UEVENT_CONSTRAINT(0x012b, 0x1),		/* OCR.* events */
+
+	INTEL_FLAGS_UEVENT_CONSTRAINT(0x04a4, 0x1),		/* TOPDOWN.BAD_SPEC_SLOTS */
+	INTEL_FLAGS_UEVENT_CONSTRAINT(0x08a4, 0x1),		/* TOPDOWN.BR_MISPREDICT_SLOTS */
+	INTEL_FLAGS_UEVENT_CONSTRAINT(0x10a4, 0x8),		/* TOPDOWN.MEMORY_BOUND_SLOTS */
+
 	INTEL_HYBRID_LDLAT_CONSTRAINT(0x1cd, 0x3fc),
 	INTEL_HYBRID_STLAT_CONSTRAINT(0x2cd, 0x3),
 	INTEL_FLAGS_UEVENT_CONSTRAINT_DATALA_LD(0x11d0, 0xf),	/* MEM_INST_RETIRED.STLB_MISS_LOADS */
@@ -1509,6 +1519,7 @@ struct event_constraint intel_lnc_pebs_event_constraints[] = {
 	INTEL_FLAGS_UEVENT_CONSTRAINT_DATALA_ST(0x42d0, 0xf),	/* MEM_INST_RETIRED.SPLIT_STORES */
 	INTEL_FLAGS_UEVENT_CONSTRAINT_DATALA_LD(0x81d0, 0xf),	/* MEM_INST_RETIRED.ALL_LOADS */
 	INTEL_FLAGS_UEVENT_CONSTRAINT_DATALA_ST(0x82d0, 0xf),	/* MEM_INST_RETIRED.ALL_STORES */
+	INTEL_FLAGS_UEVENT_CONSTRAINT(0x87d0, 0x3ff),		/* MEM_INST_RETIRED.ANY */
 
 	INTEL_FLAGS_EVENT_CONSTRAINT_DATALA_LD_RANGE(0xd1, 0xd4, 0xf),
 
@@ -1869,8 +1880,11 @@ static void intel_pmu_pebs_via_pt_enable(struct perf_event *event)
 static inline void intel_pmu_drain_large_pebs(struct cpu_hw_events *cpuc)
 {
 	if (cpuc->n_pebs == cpuc->n_large_pebs &&
-	    cpuc->n_pebs != cpuc->n_pebs_via_pt)
+	    cpuc->n_pebs != cpuc->n_pebs_via_pt) {
+		int enabled = __intel_pmu_quiesce();
 		intel_pmu_drain_pebs_buffer();
+		__intel_pmu_resume(enabled);
+	}
 }
 
 static void __intel_pmu_pebs_enable(struct perf_event *event)
@@ -2437,7 +2451,7 @@ static inline void __setup_pebs_basic_group(struct perf_event *event,
 {
 	/* The ip in basic is EventingIP */
 	set_linear_ip(regs, ip);
-	regs->flags = PERF_EFLAGS_EXACT;
+	regs->flags |= PERF_EFLAGS_EXACT;
 	setup_pebs_time(event, data, tsc);
 
 	if (sample_type & PERF_SAMPLE_WEIGHT_STRUCT)
@@ -2449,9 +2463,17 @@ static inline void __setup_pebs_gpr_group(struct perf_event *event,
 					  struct pebs_gprs *gprs,
 					  u64 sample_type)
 {
+	/*
+	 * Update flags with PEBS data. PERF_EFLAGS_EXACT must be set
+	 * in previous basic group handling.
+	 */
+	regs->flags = gprs->flags | PERF_EFLAGS_EXACT;
+
 	if (event->attr.precise_ip < 2) {
 		set_linear_ip(regs, gprs->ip);
 		regs->flags &= ~PERF_EFLAGS_EXACT;
+	} else if (regs->flags & X86_VM_MASK) {
+		regs->flags ^= (PERF_EFLAGS_VM | X86_VM_MASK);
 	}
 
 	if (sample_type & (PERF_SAMPLE_REGS_INTR | PERF_SAMPLE_REGS_USER))

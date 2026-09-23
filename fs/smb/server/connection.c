@@ -11,7 +11,10 @@
 #include "server.h"
 #include "smb_common.h"
 #include "mgmt/ksmbd_ida.h"
+#include "mgmt/user_session.h"
 #include "connection.h"
+#include "vfs_cache.h"
+#include "compress.h"
 #include "transport_tcp.h"
 #include "transport_rdma.h"
 #include "misc.h"
@@ -184,6 +187,7 @@ void ksmbd_conn_free(struct ksmbd_conn *conn)
 	kvfree(conn->request_buf);
 	kfree(conn->preauth_info);
 	kfree(conn->mechToken);
+	ksmbd_preauth_session_destroy(conn);
 	ksmbd_conn_put(conn);
 }
 
@@ -222,6 +226,7 @@ struct ksmbd_conn *ksmbd_conn_alloc(void)
 	init_waitqueue_head(&conn->r_count_q);
 	INIT_LIST_HEAD(&conn->requests);
 	INIT_LIST_HEAD(&conn->async_requests);
+	INIT_LIST_HEAD(&conn->preauth_sess_table);
 	spin_lock_init(&conn->request_lock);
 	spin_lock_init(&conn->credits_lock);
 	ida_init(&conn->async_ida);
@@ -290,6 +295,26 @@ void ksmbd_conn_try_dequeue_request(struct ksmbd_work *work)
 	wake_up_all(&conn->req_running_q);
 }
 
+static void ksmbd_conn_cancel_async_requests(struct ksmbd_conn *conn)
+{
+	struct ksmbd_work *work, *tmp;
+
+	ksmbd_debug(CONN, "Cancel pending async requests on releasing connection\n");
+	spin_lock(&conn->request_lock);
+	list_for_each_entry_safe(work, tmp, &conn->async_requests,
+				 async_request_entry) {
+		if (cmpxchg(&work->state, KSMBD_WORK_ACTIVE,
+			    KSMBD_WORK_CANCELLED) != KSMBD_WORK_ACTIVE)
+			continue;
+
+		ksmbd_debug(CONN, "Cancel async request id %d\n",
+			    work->async_id);
+		if (work->cancel_fn)
+			work->cancel_fn(work->cancel_argv);
+	}
+	spin_unlock(&conn->request_lock);
+}
+
 void ksmbd_conn_lock(struct ksmbd_conn *conn)
 {
 	mutex_lock(&conn->srv_mutex);
@@ -300,17 +325,55 @@ void ksmbd_conn_unlock(struct ksmbd_conn *conn)
 	mutex_unlock(&conn->srv_mutex);
 }
 
-void ksmbd_all_conn_set_status(u64 sess_id, u32 status)
+static bool ksmbd_session_is_bound_to_conn(struct ksmbd_session *sess,
+					   struct ksmbd_conn *conn)
+{
+	bool found;
+
+	rcu_read_lock();
+	found = xa_load(&conn->sessions, sess->id) == sess;
+	rcu_read_unlock();
+	if (found)
+		return true;
+
+	down_read(&sess->chann_lock);
+	found = xa_load(&sess->ksmbd_chann_list, (long)conn);
+	up_read(&sess->chann_lock);
+	return found;
+}
+
+void ksmbd_all_conn_set_status(struct ksmbd_session *sess, u32 status)
 {
 	struct ksmbd_conn *conn;
 	int bkt;
 
 	down_read(&conn_list_lock);
 	hash_for_each(conn_list, bkt, conn, hlist) {
-		if (conn->binding || xa_load(&conn->sessions, sess_id))
-			WRITE_ONCE(conn->status, status);
+		if (ksmbd_session_is_bound_to_conn(sess, conn)) {
+			spin_lock(&conn->request_lock);
+			if (!ksmbd_conn_exiting(conn) &&
+			    !ksmbd_conn_releasing(conn))
+				WRITE_ONCE(conn->status, status);
+			spin_unlock(&conn->request_lock);
+		}
 	}
 	up_read(&conn_list_lock);
+}
+
+void ksmbd_conn_abort(struct ksmbd_conn *conn)
+{
+	bool shutdown = false;
+
+	spin_lock(&conn->request_lock);
+	if (!ksmbd_conn_exiting(conn) && !ksmbd_conn_releasing(conn)) {
+		ksmbd_conn_set_exiting(conn);
+		shutdown = true;
+	}
+	spin_unlock(&conn->request_lock);
+	wake_up_all(&conn->req_running_q);
+
+	if (shutdown && conn->transport->ops->shutdown)
+		conn->transport->ops->shutdown(conn->transport);
 }
 
 void ksmbd_conn_wait_idle(struct ksmbd_conn *conn)
@@ -318,7 +381,8 @@ void ksmbd_conn_wait_idle(struct ksmbd_conn *conn)
 	wait_event(conn->req_running_q, atomic_read(&conn->req_running) < 2);
 }
 
-int ksmbd_conn_wait_idle_sess_id(struct ksmbd_conn *curr_conn, u64 sess_id)
+int ksmbd_conn_wait_idle_sess(struct ksmbd_conn *curr_conn,
+			      struct ksmbd_session *sess)
 {
 	struct ksmbd_conn *conn;
 	int rc, retry_count = 0, max_timeout = 120;
@@ -328,9 +392,12 @@ retry_idle:
 	if (retry_count >= max_timeout)
 		return -EIO;
 
+	/* A blocked byte-range lock cannot drain until teardown wakes it. */
+	ksmbd_wake_session_blocked_works(sess);
+
 	down_read(&conn_list_lock);
 	hash_for_each(conn_list, bkt, conn, hlist) {
-		if (conn->binding || xa_load(&conn->sessions, sess_id)) {
+		if (ksmbd_session_is_bound_to_conn(sess, conn)) {
 			rcount = (conn == curr_conn) ? 2 : 1;
 			if (atomic_read(&conn->req_running) >= rcount) {
 				rc = wait_event_timeout(conn->req_running_q,
@@ -440,6 +507,8 @@ bool ksmbd_conn_alive(struct ksmbd_conn *conn)
 /* "+2" for BCC field (ByteCount, 2 bytes) */
 #define SMB1_MIN_SUPPORTED_PDU_SIZE (sizeof(struct smb_hdr) + 2)
 #define SMB2_MIN_SUPPORTED_PDU_SIZE (sizeof(struct smb2_pdu))
+#define SMB2_TRANSFORM_MIN_SUPPORTED_PDU_SIZE	\
+	(sizeof(struct smb2_transform_hdr) + sizeof(struct smb2_hdr))
 
 /**
  * ksmbd_conn_handler_loop() - session thread to listen on new smb requests
@@ -454,6 +523,7 @@ int ksmbd_conn_handler_loop(void *p)
 	struct ksmbd_conn *conn = (struct ksmbd_conn *)p;
 	struct ksmbd_transport *t = conn->transport;
 	unsigned int pdu_size, max_allowed_pdu_size, max_req;
+	__le32 proto;
 	char hdr_buf[4] = {0,};
 	int size;
 
@@ -484,11 +554,7 @@ recheck:
 		pdu_size = get_rfc1002_len(hdr_buf);
 		ksmbd_debug(CONN, "RFC1002 header %u bytes\n", pdu_size);
 
-		if (ksmbd_conn_good(conn))
-			max_allowed_pdu_size =
-				SMB3_MAX_MSGSIZE + conn->vals->max_write_size;
-		else
-			max_allowed_pdu_size = SMB3_MAX_MSGSIZE;
+		max_allowed_pdu_size = ksmbd_max_allowed_pdu_size(conn);
 
 		if (pdu_size > max_allowed_pdu_size) {
 			pr_err_ratelimited("PDU length(%u) exceeded maximum allowed pdu size(%u) on connection(%d)\n",
@@ -531,14 +597,28 @@ recheck:
 			continue;
 		}
 
+		if (((struct smb2_hdr *)smb_get_msg(conn->request_buf))->ProtocolId ==
+		    SMB2_COMPRESSION_TRANSFORM_ID) {
+			/*
+			 * Convert the transform into a normal RFC1002-framed SMB2
+			 * request before protocol validation and work allocation.
+			 */
+			if (ksmbd_decompress_request(conn))
+				break;
+			pdu_size = get_rfc1002_len(conn->request_buf);
+		}
+
 		if (!ksmbd_smb_request(conn))
 			break;
 
-		if (((struct smb2_hdr *)smb_get_msg(conn->request_buf))->ProtocolId ==
-		    SMB2_PROTO_NUMBER) {
-			if (pdu_size < SMB2_MIN_SUPPORTED_PDU_SIZE)
-				break;
-		}
+		proto = *(__le32 *)smb_get_msg(conn->request_buf);
+		if (proto == SMB2_PROTO_NUMBER &&
+		    pdu_size < SMB2_MIN_SUPPORTED_PDU_SIZE)
+			break;
+
+		if (proto == SMB2_TRANSFORM_PROTO_NUM &&
+		    pdu_size < SMB2_TRANSFORM_MIN_SUPPORTED_PDU_SIZE)
+			break;
 
 		if (!default_conn_ops.process_fn) {
 			pr_err("No connection request callback\n");
@@ -552,6 +632,7 @@ recheck:
 	}
 
 	ksmbd_conn_set_releasing(conn);
+	ksmbd_conn_cancel_async_requests(conn);
 	/* Wait till all reference dropped to the Server object*/
 	ksmbd_debug(CONN, "Wait for all pending requests(%d)\n", atomic_read(&conn->r_count));
 	wait_event(conn->r_count_q, atomic_read(&conn->r_count) == 0);
@@ -609,7 +690,8 @@ int ksmbd_conn_transport_init(void)
 	}
 out:
 	mutex_unlock(&init_lock);
-	create_proc_clients();
+	if (create_proc_clients())
+		pr_warn("Unable to create clients procfs entry\n");
 	return ret;
 }
 
@@ -643,8 +725,10 @@ again:
 		 * handler exited its receive loop for an unrelated
 		 * reason).
 		 */
-		if (READ_ONCE(conn->status) != KSMBD_SESS_RELEASING)
+		spin_lock(&conn->request_lock);
+		if (!ksmbd_conn_releasing(conn))
 			ksmbd_conn_set_exiting(conn);
+		spin_unlock(&conn->request_lock);
 		target = conn;
 		break;
 	}

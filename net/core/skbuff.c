@@ -78,6 +78,7 @@
 #include <net/mpls.h>
 #include <net/mptcp.h>
 #include <net/mctp.h>
+#include <net/tcp.h>
 #include <net/can.h>
 #include <net/page_pool/helpers.h>
 #include <net/psp/types.h>
@@ -96,7 +97,6 @@
 #include "devmem.h"
 #include "net-sysfs.h"
 #include "netmem_priv.h"
-#include "sock_destructor.h"
 
 #ifdef CONFIG_SKB_EXTENSIONS
 static struct kmem_cache *skbuff_ext_cache __ro_after_init;
@@ -288,11 +288,11 @@ static inline struct sk_buff *napi_skb_cache_get(bool alloc)
 
 	local_lock_nested_bh(&napi_alloc_cache.bh_lock);
 	if (unlikely(!nc->skb_count)) {
-		if (alloc)
-			nc->skb_count = kmem_cache_alloc_bulk(net_hotdata.skbuff_cache,
-						GFP_ATOMIC | __GFP_NOWARN,
-						NAPI_SKB_CACHE_BULK,
-						nc->skb_cache);
+		if (alloc && kmem_cache_alloc_bulk(net_hotdata.skbuff_cache,
+						   GFP_ATOMIC | __GFP_NOWARN,
+						   NAPI_SKB_CACHE_BULK,
+						   nc->skb_cache))
+			nc->skb_count = NAPI_SKB_CACHE_BULK;
 		if (unlikely(!nc->skb_count)) {
 			local_unlock_nested_bh(&napi_alloc_cache.bh_lock);
 			return NULL;
@@ -353,16 +353,18 @@ u32 napi_skb_cache_get_bulk(void **skbs, u32 n)
 
 	/* No enough cached skbs. Try refilling the cache first */
 	bulk = min(NAPI_SKB_CACHE_SIZE - nc->skb_count, NAPI_SKB_CACHE_BULK);
-	nc->skb_count += kmem_cache_alloc_bulk(net_hotdata.skbuff_cache,
-					       GFP_ATOMIC | __GFP_NOWARN, bulk,
-					       &nc->skb_cache[nc->skb_count]);
+	if (kmem_cache_alloc_bulk(net_hotdata.skbuff_cache,
+				  GFP_ATOMIC | __GFP_NOWARN, bulk,
+				  &nc->skb_cache[nc->skb_count]))
+		nc->skb_count += bulk;
 	if (likely(nc->skb_count >= n))
 		goto get;
 
 	/* Still not enough. Bulk-allocate the missing part directly, zeroed */
-	n -= kmem_cache_alloc_bulk(net_hotdata.skbuff_cache,
-				   GFP_ATOMIC | __GFP_ZERO | __GFP_NOWARN,
-				   n - nc->skb_count, &skbs[nc->skb_count]);
+	if (kmem_cache_alloc_bulk(net_hotdata.skbuff_cache,
+				  GFP_ATOMIC | __GFP_ZERO | __GFP_NOWARN,
+				  n - nc->skb_count, &skbs[nc->skb_count]))
+		n = nc->skb_count;
 	if (likely(nc->skb_count >= n))
 		goto get;
 
@@ -925,6 +927,18 @@ static void skb_clone_fraglist(struct sk_buff *skb)
 		skb_get(list);
 }
 
+/**
+ * skb_pp_cow_data() - copy skb data into page-pool backed storage
+ * @pool: page pool to allocate from
+ * @pskb: pointer to skb pointer, replaced with the copied skb on success
+ * @headroom: headroom to reserve in the copied skb
+ *
+ * skb_copy_bits() handles both frags[] and frag_list input. If the copied
+ * skb remains non-linear, it uses frags[], which is the representation used
+ * by XDP multi-buffer.
+ *
+ * Return: 0 on success or a negative errno on failure.
+ */
 int skb_pp_cow_data(struct page_pool *pool, struct sk_buff **pskb,
 		    unsigned int headroom)
 {
@@ -933,12 +947,6 @@ int skb_pp_cow_data(struct page_pool *pool, struct sk_buff **pskb,
 	struct sk_buff *skb = *pskb, *nskb;
 	int err, i, head_off;
 	void *data;
-
-	/* XDP does not support fraglist so we need to linearize
-	 * the skb.
-	 */
-	if (skb_has_frag_list(skb))
-		return -EOPNOTSUPP;
 
 	max_head_size = SKB_WITH_OVERHEAD(PAGE_SIZE - headroom);
 	if (skb->len > max_head_size + MAX_SKB_FRAGS * PAGE_SIZE)
@@ -1206,7 +1214,7 @@ void __kfree_skb(struct sk_buff *skb)
 EXPORT_SYMBOL(__kfree_skb);
 
 static __always_inline
-bool __sk_skb_reason_drop(struct sock *sk, struct sk_buff *skb,
+bool __sk_skb_reason_drop(const struct sock *sk, struct sk_buff *skb,
 			  enum skb_drop_reason reason)
 {
 	if (unlikely(!skb_unref(skb)))
@@ -1235,7 +1243,8 @@ bool __sk_skb_reason_drop(struct sock *sk, struct sk_buff *skb,
  *	'kfree_skb' tracepoint.
  */
 void __fix_address
-sk_skb_reason_drop(struct sock *sk, struct sk_buff *skb, enum skb_drop_reason reason)
+sk_skb_reason_drop(const struct sock *sk, struct sk_buff *skb,
+		   enum skb_drop_reason reason)
 {
 	if (__sk_skb_reason_drop(sk, skb, reason))
 		__kfree_skb(skb);
@@ -1408,10 +1417,13 @@ EXPORT_SYMBOL(skb_dump);
  *
  *	Report xmit error if a device callback is tracking this skb.
  *	skb must be freed afterwards.
+ *
+ *	Does nothing for a cloned skb: the zerocopy state lives in
+ *	skb_shinfo(), which the clones share.
  */
 void skb_tx_error(struct sk_buff *skb)
 {
-	if (skb) {
+	if (skb && !skb_cloned(skb)) {
 		skb_zcopy_downgrade_managed(skb);
 		skb_zcopy_clear(skb, true);
 	}
@@ -1992,11 +2004,11 @@ int skb_copy_ubufs(struct sk_buff *skb, gfp_t gfp_mask)
 	int i, order, psize, new_frags;
 	u32 d_off;
 
-	if (skb_shared(skb) || skb_unclone(skb, gfp_mask))
-		return -EINVAL;
-
 	if (!skb_frags_readable(skb))
 		return -EFAULT;
+
+	if (skb_shared(skb) || skb_unclone(skb, gfp_mask))
+		return -EINVAL;
 
 	if (!num_frags)
 		goto release;
@@ -3898,10 +3910,9 @@ skb_zerocopy(struct sk_buff *to, struct sk_buff *from, int len, int hlen)
 
 	skb_len_add(to, len + plen);
 
-	if (unlikely(skb_orphan_frags(from, GFP_ATOMIC))) {
-		skb_tx_error(from);
+	if (unlikely(skb_orphan_frags(from, GFP_ATOMIC)))
 		return -ENOMEM;
-	}
+
 	skb_zerocopy_clone(to, from, GFP_ATOMIC);
 
 	for (i = 0; i < skb_shinfo(from)->nr_frags; i++) {
@@ -6666,6 +6677,13 @@ int skb_mpls_pop(struct sk_buff *skb, __be16 next_proto, int mac_len,
 		skb_mod_eth_type(skb, hdr, next_proto);
 	}
 	skb->protocol = next_proto;
+
+	/* The last label is gone, so the inner header recorded by
+	 * skb_mpls_push() no longer describes this packet. Drop it, or a
+	 * later push keeps the stale offset.
+	 */
+	if (!eth_p_mpls(next_proto))
+		skb->inner_protocol = 0;
 
 	return 0;
 }
